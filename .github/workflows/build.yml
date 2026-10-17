@@ -1,0 +1,822 @@
+name: Build Nexton APK
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Generate Complete Nexton Android Project
+        run: |
+          mkdir -p app/src/main/java/com/nextonbiotex/quickreply
+          mkdir -p app/src/main/res/xml
+
+          cat << 'EOF' > settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "NextonQuickReply"
+          include ':app'
+          EOF
+
+          cat << 'EOF' > build.gradle
+          plugins {
+              id 'com.android.application' version '8.2.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+          }
+          EOF
+
+          cat << 'EOF' > gradle.properties
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2048m
+          EOF
+
+          cat << 'EOF' > app/build.gradle
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+
+          android {
+              namespace 'com.nextonbiotex.quickreply'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.nextonbiotex.quickreply"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.core:core-ktx:1.12.0'
+              implementation 'androidx.appcompat:appcompat:1.6.1'
+              implementation 'androidx.activity:activity-ktx:1.8.2'
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="Nexton Quick Reply"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.AppCompat.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".QuickReplyService"
+                      android:exported="true"
+                      android:label="Nexton Biotex Quick Reply"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.provider"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
+
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/res/xml/accessibility_config.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeViewTextChanged|typeViewFocused|typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagRetrieveInteractiveWindows|flagReportViewIds"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="50" />
+          EOF
+
+          cat << 'EOF' > app/src/main/res/xml/file_paths.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths>
+              <files-path name="media" path="media/" />
+          </paths>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/nextonbiotex/quickreply/QuickReplyService.kt
+          package com.nextonbiotex.quickreply
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.core.content.FileProvider
+          import org.json.JSONArray
+          import java.io.File
+
+          class QuickReplyService : AccessibilityService() {
+
+              private lateinit var windowManager: WindowManager
+              private var popupView: View? = null
+              private var bubbleView: View? = null
+              private var lastEditableNode: AccessibilityNodeInfo? = null
+              private var currentActivePackage: String = ""
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+                  showFloatingBubble()
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  if (event == null) return
+
+                  val pkg = event.packageName?.toString() ?: ""
+                  if (pkg.isNotEmpty() && pkg != packageName) {
+                      currentActivePackage = pkg
+                  }
+
+                  val source = event.source ?: return
+                  if (source.isEditable) {
+                      lastEditableNode = source
+                  }
+
+                  if (event.eventType == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) {
+                      val currentText = event.text?.joinToString("") ?: ""
+                      val slashIndex = currentText.lastIndexOf("/")
+                      if (slashIndex != -1) {
+                          val query = currentText.substring(slashIndex + 1).trim().lowercase()
+                          showQuickReplyPopup(query)
+                      } else {
+                          removePopup()
+                      }
+                  }
+              }
+
+              private fun showFloatingBubble() {
+                  if (!Settings.canDrawOverlays(this) || bubbleView != null) return
+
+                  val bubble = TextView(this).apply {
+                      text = "NB"
+                      textSize = 14f
+                      setTextColor(Color.WHITE)
+                      gravity = Gravity.CENTER
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(Color.parseColor("#0D9488"))
+                          setStroke(3, Color.WHITE)
+                      }
+                      setPadding(24, 24, 24, 24)
+                  }
+
+                  val layoutFlag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                  else WindowManager.LayoutParams.TYPE_PHONE
+
+                  val params = WindowManager.LayoutParams(
+                      120, 120, layoutFlag,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = 20
+                      y = 300
+                  }
+
+                  var initialX = 0
+                  var initialY = 0
+                  var initialTouchX = 0f
+                  var initialTouchY = 0f
+
+                  bubble.setOnTouchListener { _, event ->
+                      when (event.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              initialX = params.x
+                              initialY = params.y
+                              initialTouchX = event.rawX
+                              initialTouchY = event.rawY
+                              true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              params.x = initialX + (event.rawX - initialTouchX).toInt()
+                              params.y = initialY + (event.rawY - initialTouchY).toInt()
+                              windowManager.updateViewLayout(bubble, params)
+                              true
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              if (Math.abs(event.rawX - initialTouchX) < 15 && Math.abs(event.rawY - initialTouchY) < 15) {
+                                  if (popupView == null) showQuickReplyPopup("") else removePopup()
+                              }
+                              true
+                          }
+                          else -> false
+                      }
+                  }
+
+                  bubbleView = bubble
+                  windowManager.addView(bubbleView, params)
+              }
+
+              private fun showQuickReplyPopup(query: String) {
+                  if (!Settings.canDrawOverlays(this)) return
+                  removePopup()
+
+                  val replies = loadReplies().filter {
+                      query.isEmpty() ||
+                      it.shortcut.lowercase().contains(query) ||
+                      it.title.lowercase().contains(query)
+                  }
+
+                  if (replies.isEmpty()) return
+
+                  val container = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(20, 20, 20, 20)
+                      background = GradientDrawable().apply {
+                          cornerRadius = 24f
+                          setColor(Color.parseColor("#F8FAFC"))
+                          setStroke(3, Color.parseColor("#0D9488"))
+                      }
+                  }
+
+                  val header = TextView(this).apply {
+                      text = "⚡ Nexton Quick Replies (Tap to Send)   [✖]"
+                      setTextColor(Color.parseColor("#0F766E"))
+                      textSize = 13f
+                      setPadding(10, 6, 10, 14)
+                      setOnClickListener { removePopup() }
+                  }
+                  container.addView(header)
+
+                  val scroll = ScrollView(this)
+                  val listLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+                  replies.forEach { item ->
+                      val card = LinearLayout(this).apply {
+                          orientation = LinearLayout.VERTICAL
+                          setPadding(20, 16, 20, 16)
+                          background = GradientDrawable().apply {
+                              cornerRadius = 16f
+                              setColor(Color.WHITE)
+                              setStroke(1, Color.parseColor("#CBD5E1"))
+                          }
+                          val lp = LinearLayout.LayoutParams(
+                              LinearLayout.LayoutParams.MATCH_PARENT,
+                              LinearLayout.LayoutParams.WRAP_CONTENT
+                          )
+                          lp.setMargins(0, 0, 0, 12)
+                          layoutParams = lp
+                          setOnClickListener {
+                              sendQuickReply(item)
+                              removePopup()
+                          }
+                      }
+
+                      val mediaTags = mutableListOf<String>()
+                      if (item.imagePath.isNotEmpty()) mediaTags.add("Photo/Video")
+                      if (item.audioPath.isNotEmpty()) mediaTags.add("Voice Note")
+                      val mediaBadge = if (mediaTags.isEmpty()) "Text Only" else mediaTags.joinToString(" + ")
+
+                      val titleView = TextView(this).apply {
+                          text = "/${item.shortcut}  •  ${item.title}  ($mediaBadge)"
+                          setTextColor(Color.parseColor("#0F172A"))
+                          textSize = 14f
+                      }
+
+                      val msgPreview = TextView(this).apply {
+                          text = item.message.take(70) + if (item.message.length > 70) "..." else ""
+                          setTextColor(Color.parseColor("#475569"))
+                          textSize = 12f
+                      }
+
+                      card.addView(titleView)
+                      card.addView(msgPreview)
+                      listLayout.addView(card)
+                  }
+
+                  scroll.addView(listLayout)
+                  container.addView(scroll, LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT, 420
+                  ))
+
+                  val layoutFlag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                  else WindowManager.LayoutParams.TYPE_PHONE
+
+                  val params = WindowManager.LayoutParams(
+                      (resources.displayMetrics.widthPixels * 0.90).toInt(),
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      layoutFlag,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                      y = 180
+                  }
+
+                  popupView = container
+                  windowManager.addView(popupView, params)
+              }
+
+              private fun sendQuickReply(item: ReplyItem) {
+                  val targetNode = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: lastEditableNode
+                  if (targetNode != null) {
+                      val args = Bundle()
+                      args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, item.message)
+                      targetNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                  }
+
+                  val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                  clipboard.setPrimaryClip(ClipData.newPlainText("QuickReply", item.message))
+
+                  val uris = ArrayList<Uri>()
+                  if (item.imagePath.isNotEmpty()) {
+                      val f = File(item.imagePath)
+                      if (f.exists()) uris.add(FileProvider.getUriForFile(this, "$packageName.provider", f))
+                  }
+                  if (item.audioPath.isNotEmpty()) {
+                      val f = File(item.audioPath)
+                      if (f.exists()) uris.add(FileProvider.getUriForFile(this, "$packageName.provider", f))
+                  }
+
+                  if (uris.isNotEmpty()) {
+                      try {
+                          val shareIntent = Intent().apply {
+                              if (uris.size == 1) {
+                                  action = Intent.ACTION_SEND
+                                  putExtra(Intent.EXTRA_STREAM, uris[0])
+                              } else {
+                                  action = Intent.ACTION_SEND_MULTIPLE
+                                  putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                              }
+                              putExtra(Intent.EXTRA_TEXT, item.message)
+                              type = "*/*"
+                              addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                              if (currentActivePackage.isNotEmpty()) {
+                                  setPackage(currentActivePackage)
+                              }
+                          }
+                          startActivity(shareIntent)
+                      } catch (e: Exception) {
+                          Toast.makeText(this, "Text pasted! Media error: ${e.message}", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+              }
+
+              private fun removePopup() {
+                  popupView?.let {
+                      try { windowManager.removeView(it) } catch (_: Exception) {}
+                      popupView = null
+                  }
+              }
+
+              private fun loadReplies(): List<ReplyItem> {
+                  val prefs = getSharedPreferences("nexton_replies", Context.MODE_PRIVATE)
+                  val raw = prefs.getString("data", "[]") ?: "[]"
+                  val arr = JSONArray(raw)
+                  val list = mutableListOf<ReplyItem>()
+                  for (i in 0 until arr.length()) {
+                      val obj = arr.getJSONObject(i)
+                      list.add(
+                          ReplyItem(
+                              id = obj.optString("id"),
+                              title = obj.optString("title"),
+                              shortcut = obj.optString("shortcut"),
+                              message = obj.optString("message"),
+                              imagePath = obj.optString("imagePath"),
+                              audioPath = obj.optString("audioPath")
+                          )
+                      )
+                  }
+                  return list
+              }
+
+              override fun onInterrupt() {
+                  removePopup()
+              }
+          }
+
+          data class ReplyItem(
+              val id: String,
+              val title: String,
+              val shortcut: String,
+              val message: String,
+              val imagePath: String = "",
+              val audioPath: String = ""
+          )
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/nextonbiotex/quickreply/MainActivity.kt
+          package com.nextonbiotex.quickreply
+
+          import android.app.AlertDialog
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.Editable
+          import android.text.TextWatcher
+          import android.view.Gravity
+          import android.widget.*
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.util.UUID
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var listContainer: LinearLayout
+              private var selectedImagePath: String = ""
+              private var selectedAudioPath: String = ""
+              private var mediaStatusLabel: TextView? = null
+              private var searchQuery: String = ""
+
+              private val pickImageLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+                  uri?.let {
+                      selectedImagePath = copyUriToInternalStorage(it, "img_${System.currentTimeMillis()}.jpg")
+                      updateMediaStatusLabel()
+                  }
+              }
+
+              private val pickAudioLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+                  uri?.let {
+                      selectedAudioPath = copyUriToInternalStorage(it, "aud_${System.currentTimeMillis()}.ogg")
+                      updateMediaStatusLabel()
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.parseColor("#F1F5F9"))
+                      setPadding(32, 40, 32, 32)
+                  }
+
+                  val title = TextView(this).apply {
+                      text = "Nexton Biotex - Smart Quick Reply"
+                      textSize = 20f
+                      setTextColor(Color.parseColor("#0F766E"))
+                      setPadding(0, 0, 0, 20)
+                  }
+                  root.addView(title)
+
+                  val permLayout = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      setPadding(0, 0, 0, 24)
+                  }
+
+                  val btnOverlay = Button(this).apply {
+                      text = "1. Enable Overlay"
+                      setOnClickListener {
+                          startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                      }
+                  }
+
+                  val btnAccess = Button(this).apply {
+                      text = "2. Enable Accessibility"
+                      setOnClickListener {
+                          startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                      }
+                  }
+
+                  permLayout.addView(btnOverlay, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  permLayout.addView(btnAccess, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  root.addView(permLayout)
+
+                  val btnAdd = Button(this).apply {
+                      text = "+ Add New Quick Reply (Product / Voice / Photo)"
+                      setTextColor(Color.WHITE)
+                      background = GradientDrawable().apply {
+                          cornerRadius = 16f
+                          setColor(Color.parseColor("#0D9488"))
+                      }
+                      setOnClickListener { showAddOrEditDialog(null) }
+                  }
+                  root.addView(btnAdd)
+
+                  val searchBox = EditText(this).apply {
+                      hint = "Search by product name or /shortcut..."
+                      setPadding(24, 24, 24, 24)
+                      addTextChangedListener(object : TextWatcher {
+                          override fun afterTextChanged(s: Editable?) {
+                              searchQuery = s?.toString()?.trim()?.lowercase() ?: ""
+                              refreshList()
+                          }
+                          override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                          override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                      })
+                  }
+                  root.addView(searchBox)
+
+                  val scroll = ScrollView(this)
+                  listContainer = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(0, 16, 0, 100)
+                  }
+                  scroll.addView(listContainer)
+                  root.addView(scroll, LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT,
+                      LinearLayout.LayoutParams.MATCH_PARENT
+                  ))
+
+                  setContentView(root)
+                  refreshList()
+              }
+
+              private fun showAddOrEditDialog(existing: ReplyItem?) {
+                  selectedImagePath = existing?.imagePath ?: ""
+                  selectedAudioPath = existing?.audioPath ?: ""
+
+                  val dialogLayout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(40, 30, 40, 20)
+                  }
+
+                  val inputTitle = EditText(this).apply {
+                      hint = "Product / Reply Title (e.g. Panadol Syrup)"
+                      setText(existing?.title ?: "")
+                  }
+
+                  val inputShortcut = EditText(this).apply {
+                      hint = "Shortcut without slash (e.g. panadol)"
+                      setText(existing?.shortcut ?: "")
+                  }
+
+                  val inputMessage = EditText(this).apply {
+                      hint = "Message Text (Price, usage details, delivery info...)"
+                      minLines = 3
+                      setText(existing?.message ?: "")
+                  }
+
+                  val btnPickImage = Button(this).apply {
+                      text = "Attach Photo / Video"
+                      setOnClickListener { pickImageLauncher.launch("*/*") }
+                  }
+
+                  val btnPickAudio = Button(this).apply {
+                      text = "Attach Audio / Voice Note (.mp3 / .ogg)"
+                      setOnClickListener { pickAudioLauncher.launch("audio/*") }
+                  }
+
+                  mediaStatusLabel = TextView(this).apply {
+                      setPadding(8, 12, 8, 12)
+                      setTextColor(Color.parseColor("#0F766E"))
+                  }
+                  updateMediaStatusLabel()
+
+                  dialogLayout.addView(inputTitle)
+                  dialogLayout.addView(inputShortcut)
+                  dialogLayout.addView(inputMessage)
+                  dialogLayout.addView(btnPickImage)
+                  dialogLayout.addView(btnPickAudio)
+                  dialogLayout.addView(mediaStatusLabel)
+
+                  AlertDialog.Builder(this)
+                      .setTitle(if (existing == null) "New Quick Reply" else "Edit Quick Reply")
+                      .setView(dialogLayout)
+                      .setPositiveButton("Save") { _, _ ->
+                          val title = inputTitle.text.toString().trim()
+                          val shortcut = inputShortcut.text.toString().trim().removePrefix("/")
+                          val message = inputMessage.text.toString().trim()
+
+                          if (title.isEmpty() || shortcut.isEmpty() || message.isEmpty()) {
+                              Toast.makeText(this, "Please fill Title, Shortcut & Message!", Toast.LENGTH_SHORT).show()
+                              return@setPositiveButton
+                          }
+
+                          saveReply(
+                              ReplyItem(
+                                  id = existing?.id ?: UUID.randomUUID().toString(),
+                                  title = title,
+                                  shortcut = shortcut,
+                                  message = message,
+                                  imagePath = selectedImagePath,
+                                  audioPath = selectedAudioPath
+                              )
+                          )
+                          refreshList()
+                      }
+                      .setNegativeButton("Cancel", null)
+                      .show()
+              }
+
+              private fun updateMediaStatusLabel() {
+                  val status = mutableListOf<String>()
+                  if (selectedImagePath.isNotEmpty()) status.add("Photo/Video Attached")
+                  if (selectedAudioPath.isNotEmpty()) status.add("Audio Attached")
+                  mediaStatusLabel?.text = if (status.isEmpty()) "No media attached yet" else status.joinToString(" | ")
+              }
+
+              private fun copyUriToInternalStorage(uri: Uri, fileName: String): String {
+                  val mediaDir = File(filesDir, "media")
+                  if (!mediaDir.exists()) mediaDir.mkdirs()
+                  val destFile = File(mediaDir, fileName)
+                  contentResolver.openInputStream(uri)?.use { input ->
+                      FileOutputStream(destFile).use { output ->
+                          input.copyTo(output)
+                      }
+                  }
+                  return destFile.absolutePath
+              }
+
+              private fun refreshList() {
+                  listContainer.removeAllViews()
+                  val items = getAllReplies().filter {
+                      searchQuery.isEmpty() ||
+                      it.title.lowercase().contains(searchQuery) ||
+                      it.shortcut.lowercase().contains(searchQuery)
+                  }
+
+                  items.forEach { item ->
+                      val card = LinearLayout(this).apply {
+                          orientation = LinearLayout.VERTICAL
+                          setPadding(28, 24, 28, 24)
+                          background = GradientDrawable().apply {
+                              cornerRadius = 20f
+                              setColor(Color.WHITE)
+                              setStroke(2, Color.parseColor("#E2E8F0"))
+                          }
+                          val lp = LinearLayout.LayoutParams(
+                              LinearLayout.LayoutParams.MATCH_PARENT,
+                              LinearLayout.LayoutParams.WRAP_CONTENT
+                          )
+                          lp.setMargins(0, 0, 0, 20)
+                          layoutParams = lp
+                      }
+
+                      val titleRow = TextView(this).apply {
+                          text = "${item.title}   (Shortcut: /${item.shortcut})"
+                          textSize = 16f
+                          setTextColor(Color.parseColor("#0F172A"))
+                      }
+
+                      val msgRow = TextView(this).apply {
+                          text = item.message
+                          textSize = 13f
+                          setTextColor(Color.parseColor("#475569"))
+                          setPadding(0, 8, 0, 8)
+                      }
+
+                      val actionRow = LinearLayout(this).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          gravity = Gravity.END
+                      }
+
+                      val btnEdit = Button(this).apply {
+                          text = "Edit"
+                          setOnClickListener { showAddOrEditDialog(item) }
+                      }
+
+                      val btnDelete = Button(this).apply {
+                          text = "Delete"
+                          setOnClickListener {
+                              deleteReply(item.id)
+                              refreshList()
+                          }
+                      }
+
+                      actionRow.addView(btnEdit)
+                      actionRow.addView(btnDelete)
+
+                      card.addView(titleRow)
+                      card.addView(msgRow)
+                      card.addView(actionRow)
+                      listContainer.addView(card)
+                  }
+              }
+
+              private fun getAllReplies(): MutableList<ReplyItem> {
+                  val prefs = getSharedPreferences("nexton_replies", Context.MODE_PRIVATE)
+                  val arr = JSONArray(prefs.getString("data", "[]") ?: "[]")
+                  val list = mutableListOf<ReplyItem>()
+                  for (i in 0 until arr.length()) {
+                      val o = arr.getJSONObject(i)
+                      list.add(
+                          ReplyItem(
+                              id = o.optString("id"),
+                              title = o.optString("title"),
+                              shortcut = o.optString("shortcut"),
+                              message = o.optString("message"),
+                              imagePath = o.optString("imagePath"),
+                              audioPath = o.optString("audioPath")
+                          )
+                      )
+                  }
+                  return list
+              }
+
+              private fun saveReply(newItem: ReplyItem) {
+                  val list = getAllReplies().filter { it.id != newItem.id }.toMutableList()
+                  list.add(0, newItem)
+                  saveListToPrefs(list)
+              }
+
+              private fun deleteReply(id: String) {
+                  val list = getAllReplies().filter { it.id != id }
+                  saveListToPrefs(list)
+              }
+
+              private fun saveListToPrefs(list: List<ReplyItem>) {
+                  val arr = JSONArray()
+                  list.forEach {
+                      arr.put(JSONObject().apply {
+                          put("id", it.id)
+                          put("title", it.title)
+                          put("shortcut", it.shortcut)
+                          put("message", it.message)
+                          put("imagePath", it.imagePath)
+                          put("audioPath", it.audioPath)
+                      })
+                  }
+                  getSharedPreferences("nexton_replies", Context.MODE_PRIVATE)
+                      .edit().putString("data", arr.toString()).apply()
+              }
+          }
+          EOF
+
+      - name: Build Debug APK
+        run: gradle assembleDebug
+
+      - name: Upload Ready APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nexton-QuickReply-APK
+          path: app/build/outputs/apk/debug/*.apk
